@@ -1,0 +1,11 @@
+{
+  "company": "宁德时代",
+  "report_period": "2025",
+  "section_id": "industry_competition",
+  "model": "deepseek:deepseek-chat",
+  "rag_top_k": 8,
+  "max_sub_queries": 3,
+  "max_research_rounds": 4,
+  "max_deep_research_calls": 12,
+  "verbose": true
+}
