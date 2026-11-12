@@ -126,6 +126,53 @@ def get_usage() -> dict[str, _Usage]:
     return _tracker.snapshot()
 
 
+def get_usage_summary() -> dict:
+    """返回可 JSON 序列化的用量与费用汇总（供外部脚本记录指标）。"""
+    snapshot = _tracker.snapshot()
+    now_bj = datetime.now(timezone.utc).astimezone(_BEIJING)
+    cur_period = "peak" if is_peak_time(now_bj) else "off_peak"
+
+    models = {}
+    for model, u in snapshot.items():
+        tier = _tier(model)
+        models[model] = {
+            "tier": tier,
+            "calls": u.calls,
+            "prompt_tokens": u.prompt_tokens,
+            "completion_tokens": u.completion_tokens,
+            "cache_hit_tokens": u.cache_hit_tokens,
+            "cache_miss_tokens": u.cache_miss_tokens,
+            "cost_current": round(_cost(u, tier, cur_period), 6),
+            "cost_peak": round(_cost(u, tier, "peak"), 6),
+            "cost_off_peak": round(_cost(u, tier, "off_peak"), 6),
+        }
+
+    def _sum(field):
+        return sum(getattr(u, field) for u in snapshot.values())
+
+    return {
+        "period": cur_period,
+        "period_label": period_label(now_bj),
+        "models": models,
+        "total": {
+            "calls": _sum("calls"),
+            "prompt_tokens": _sum("prompt_tokens"),
+            "completion_tokens": _sum("completion_tokens"),
+            "cache_hit_tokens": _sum("cache_hit_tokens"),
+            "cache_miss_tokens": _sum("cache_miss_tokens"),
+            "cost_current": round(
+                sum(_cost(u, _tier(m), cur_period) for m, u in snapshot.items()), 6
+            ),
+            "cost_peak": round(
+                sum(_cost(u, _tier(m), "peak") for m, u in snapshot.items()), 6
+            ),
+            "cost_off_peak": round(
+                sum(_cost(u, _tier(m), "off_peak") for m, u in snapshot.items()), 6
+            ),
+        },
+    }
+
+
 class UsageCallback(BaseCallbackHandler):
     """LangChain 回调：捕获 Agent（Chief Researcher / researcher 子 agent）的 token 用量。"""
 
