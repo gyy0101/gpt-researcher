@@ -12,16 +12,17 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from my_deepagent import llm, rag
 
+CITATION_RULE = (
+    "引用规范：正文关键结论后用 [n] 标注来源编号（如 [1]，或多来源 [2][3]）；"
+    "末尾附「来源」列表，每行 [n] 来源名称。"
+    "来源名称只写券商研报或年报（如「宁德时代 2025 年年报」「东吴证券研报」），"
+    "不写页码、不写内部文件路径；不得伪造来源编号。"
+)
+
 
 def _chunk_source(chunk) -> str:
-    title = chunk.get("title") or "未命名文档"
-    page = chunk.get("page_num_int")
-    doc_id = chunk.get("doc_id") or ""
-    if page:
-        return f"{title} (第{page}页)"
-    if doc_id:
-        return f"{title} [{doc_id[:8]}]"
-    return title
+    """来源标注：只返回文档标题（券商研报/年报名称），不附页码；引用统一用 [n] 编号。"""
+    return chunk.get("title") or "未命名文档"
 
 
 def _chunk_content(chunk) -> str:
@@ -135,7 +136,8 @@ def _synthesize(query: str, context: str) -> str:
         f"1. 使用中文，结构清晰，可用小标题组织；\n"
         f"2. 每个关键结论后用 [n] 标注对应的资料来源编号（与末尾 Sources 列表的序号一致）；\n"
         f"3. 只依据给定资料，不编造资料中没有的信息；\n"
-        f"4. 数据要注明出处。\n\n"
+        f"4. 数据要注明出处。\n"
+        f"5. {CITATION_RULE}\n\n"
         f"资料如下：\n\n{context}"
     )
     return llm.chat([{"role": "user", "content": prompt}], temperature=0.3, max_tokens=4096)
