@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import re
 import threading
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -192,6 +193,27 @@ def _trim_quick_result(content: str) -> str:
     )
 
 
+def _is_within_dir(path: Path, base: Path) -> bool:
+    """判断 ``path`` 是否位于 ``base`` 目录内（含目录本身）。
+
+    使用 ``Path.relative_to`` 而非字符串前缀匹配，避免 ``/a/b`` 与
+    ``/a/b2`` 这类前缀串导致越界路径被误判为安全。
+    """
+    try:
+        path.relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """原子写入文本：先写临时文件再替换，避免进程中断留下半截文件。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(content, encoding="utf-8")
+    temp.replace(path)
+
+
 def _locate_finding(run_dir: Path, file_path: str) -> Path | None:
     """把 read_file 传入的路径定位到 findings 目录下的真实文件；非 Findings 返回 None。"""
     run_dir = Path(run_dir).resolve()
@@ -203,7 +225,7 @@ def _locate_finding(run_dir: Path, file_path: str) -> Path | None:
     if rel.rstrip("/").endswith("plan.md"):
         return None
     target = (run_dir / rel).resolve()
-    if not str(target).startswith(str(run_dir)):
+    if not _is_within_dir(target, run_dir):
         return None
     return target if target.is_file() else None
 
@@ -429,6 +451,20 @@ class BudgetManager:
             self._settled_tokens += int(prompt_tokens) + int(completion_tokens)
             self._settled_cost += actual_cost
 
+    def consume_reservation(self, reservation_id: int | None) -> None:
+        """异常或无 usage 场景下释放预留，不追加结算用量。
+
+        与 ``settle_usage`` 的区别：仅归还预留额度，不把任何用量计入已结算，
+        用于模型调用抛异常或缺少 usage_metadata 时防止预留永久占用预算。
+        """
+        if reservation_id is None:
+            return
+        with self._lock:
+            entry = self._reservations.pop(reservation_id, (0, 0.0))
+            upper_tokens, upper_cost = entry
+            self._reserved_tokens -= upper_tokens
+            self._reserved_cost -= upper_cost
+
     # ---- 观测 ----
 
     def summary(self) -> dict:
@@ -573,39 +609,52 @@ class BudgetMiddleware(AgentMiddleware):
         args = (request.tool_call or {}).get("args") or {}
         description = str(args.get("description") or "")
         rel_match = _FINDINGS_PATH_RE.search(description)
-        call_id = getattr(request.runtime, "tool_call_id", None) or ""
+        call_id = str((request.tool_call or {}).get("id") or "")
 
-        if self.run_dir is not None:
-            findings_dir = self.run_dir / "findings"
-            findings_dir.mkdir(parents=True, exist_ok=True)
-            if rel_match:
-                target = (self.run_dir / rel_match.group(0)).resolve()
-                if not str(target).startswith(str(self.run_dir)):
-                    target = findings_dir / f"task_{call_id}.md"
-            else:
-                target = findings_dir / f"task_{call_id}.md"
+        if self.run_dir is None:
+            return result
 
+        run_dir = self.run_dir.resolve()
+        findings_dir = run_dir / "findings"
+        findings_dir.mkdir(parents=True, exist_ok=True)
+
+        # 从 task 描述中解析出的 Findings 路径优先；仅当路径确实落在 run 目录内
+        # 才使用，否则退化为安全的固定文件名，避免越界写入。
+        target: Path | None = None
+        if rel_match:
+            candidate = (run_dir / rel_match.group(0)).resolve()
+            if _is_within_dir(candidate, run_dir):
+                target = candidate
+
+        if target is None:
+            safe_id = re.sub(r"[^A-Za-z0-9_-]", "", call_id) or uuid.uuid4().hex[:8]
+            target = findings_dir / f"task_{safe_id}.md"
+            if not _is_within_dir(target, run_dir):
+                target = findings_dir / f"task_{uuid.uuid4().hex[:8]}.md"
+
+        try:
             already_saved = (
                 target.is_file()
                 and len(target.read_text(encoding="utf-8").strip()) > 0
             )
-            if not already_saved:
-                header = (
-                    "> 程序自动持久化：该 Subagent 返回了研究内容，但未主动调用 "
-                    "write_file，以下为程序落盘的原始返回。\n\n"
-                )
-                try:
-                    target.write_text(header + content + "\n", encoding="utf-8")
-                except OSError:
-                    pass
+        except OSError:
+            already_saved = False
 
-            summary = (
-                f"研究任务已完成，结果已持久化到 {target.relative_to(self.run_dir)}"
-                f"（{len(content)} 字符）。"
+        if not already_saved:
+            header = (
+                "> 程序自动持久化：该 Subagent 返回了研究内容，但未主动调用 "
+                "write_file，以下为程序落盘的原始返回。\n\n"
             )
-            return _replace_task_result_content(result, summary)
+            try:
+                _atomic_write_text(target, header + content + "\n")
+            except OSError:
+                pass
 
-        return result
+        summary = (
+            f"研究任务已完成，结果已持久化到 {target.relative_to(run_dir)}"
+            f"（{len(content)} 字符）。"
+        )
+        return _replace_tool_content(result, summary)
 
     async def awrap_model_call(self, request: Any, handler: Any) -> Any:
         try:
@@ -629,13 +678,22 @@ class BudgetMiddleware(AgentMiddleware):
                 content="Token/费用预算已耗尽，请基于已有材料完成报告。"
             )
 
-        response = await handler(request)
+        try:
+            response = await handler(request)
+        except Exception:
+            # 模型调用抛异常时释放预留，避免预留泄漏导致预算被永久占用。
+            self.budget.consume_reservation(reservation_id)
+            raise
+
         usage = _extract_usage_metadata(response)
         if usage is not None:
             prompt, completion = usage
             self.budget.settle_usage(reservation_id, prompt, completion, model_name)
             cost = estimate_cost(prompt, completion, model_name, self.budget.pricing_tier) or 0.0
             self.budget.add_usage(scope, KIND_REASONING, prompt, completion, cost)
+        else:
+            # 缺少 usage_metadata 时释放预留，避免预留泄漏。
+            self.budget.consume_reservation(reservation_id)
         return response
 
     @staticmethod

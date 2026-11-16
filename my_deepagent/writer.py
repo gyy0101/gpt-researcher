@@ -9,6 +9,7 @@ Findings 总量超出单次上下文预算时，先做逐条证据提炼（保�
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 from typing import Any, Callable
@@ -112,37 +113,86 @@ def _digest_finding(name: str, content: str) -> str:
     )
 
 
+def _lossy_finding_fallback(name: str, content: str) -> str:
+    """提炼失败时的有损压缩兜底：保留标题结构与 SRC 标识，正文截断。
+
+    相比无脑截断，多保留一份结构索引与来源标识，让成稿阶段仍能判断
+    该 Findings 覆盖了哪些子问题、引用了哪些来源。
+    """
+    srcs = sorted(set(re.findall(r"\[SRC:[0-9a-f]{12}\]", content)))
+    headings = re.findall(r"^#{1,3}\s+.+$", content, flags=re.MULTILINE)
+    body = content[:_DIGEST_TRIGGER_CHARS]
+    lines = [f"[压缩兜底] 未能调用 LLM 提炼「{name}」，以下为截断内容："]
+    if headings:
+        lines.append("小节结构：" + " / ".join(headings[:12]))
+    if srcs:
+        lines.append(f"来源标识（{len(srcs)} 个）：" + "、".join(srcs[:20]))
+    lines.append(body)
+    return "\n".join(lines) + "\n……[已截断]"
+
+
 def _assemble_findings_context(
     findings: list[tuple[str, str, bool]],
     max_context_chars: int,
 ) -> str:
-    """按上下文预算组织 Findings；超预算时对超长条目逐条提炼。"""
-    blocks: list[str] = []
+    """按上下文预算组织 Findings；超预算时按体积从大到小逐条提炼，避免静默丢弃。
+
+    原实现只对超过 8000 字符的 Findings 做一次提炼，仍超预算时在遇到第一份
+    装不下的 Findings 处直接 ``break``，导致其后所有 Findings 被整体省略。这里
+    改为：优先提炼体积最大的未提炼条目，直到装进预算或全部已提炼；最后仍超预算
+    时，为被省略的 Findings 保留明确清单，而不是无痕迹丢弃。
+    """
+    # 每条记录为 [文件名, 正文, 完整性标记, 是否已提炼]。
+    blocks: list[list] = []
     for name, content, complete in findings:
         flag = "" if complete else "（程序标记：研究不完整）"
-        if len(content) > _DIGEST_TRIGGER_CHARS:
-            try:
-                content = _digest_finding(name, content)
-            except Exception:
-                # 提炼失败时回退为截断，保证 Writer 仍可继续。
-                content = content[:_DIGEST_TRIGGER_CHARS] + "\n……[提炼失败，已截断]"
-        blocks.append(f"## Findings：{name}{flag}\n\n{content}")
+        blocks.append([name, content, flag, False])
 
-    combined = "\n\n---\n\n".join(blocks)
+    def build() -> str:
+        parts = [
+            f"## Findings：{name}{flag}\n\n{content}"
+            for name, content, flag, _digested in blocks
+        ]
+        return "\n\n---\n\n".join(parts)
+
+    combined = build()
     if len(combined) <= max_context_chars:
         return combined
 
-    # 仍超预算（提炼后依旧过长）：按条目累计到预算内，其余标注省略。
-    kept: list[str] = []
-    used = 0
-    for block in blocks:
-        if used + len(block) > max_context_chars and kept:
+    # 超预算：优先提炼体积最大的尚未提炼条目，直至装入预算或全部已提炼。
+    while len(build()) > max_context_chars:
+        candidates = [i for i, block in enumerate(blocks) if not block[3]]
+        if not candidates:
             break
+        index = max(candidates, key=lambda i: len(blocks[i][1]))
+        name, content, flag, _ = blocks[index]
+        try:
+            digested = _digest_finding(name, content)
+        except Exception:
+            digested = _lossy_finding_fallback(name, content)
+        blocks[index] = [name, digested, flag, True]
+
+    combined = build()
+    if len(combined) <= max_context_chars:
+        return combined
+
+    # 全部提炼后仍超预算：按条目累计到预算内，其余在末尾列出明确清单。
+    kept: list[str] = []
+    omitted: list[str] = []
+    used = 0
+    for name, content, flag, _digested in blocks:
+        block = f"## Findings：{name}{flag}\n\n{content}"
+        if kept and used + len(block) > max_context_chars:
+            omitted.append(f"{name}{flag}")
+            continue
         kept.append(block)
         used += len(block)
-    omitted = len(blocks) - len(kept)
-    if omitted > 0:
-        kept.append(f"\n（另有 {omitted} 份 Findings 因上下文预算省略，详见 findings/ 目录。）")
+
+    if omitted:
+        kept.append(
+            "\n> 以下 Findings 因上下文预算已省略，请勿在正文中引用其内容：\n> "
+            + "\n> ".join(omitted)
+        )
     return "\n\n---\n\n".join(kept)
 
 
@@ -340,7 +390,7 @@ def run_writer_only(run_dir: str | Path, verbose: bool = True) -> str:
         _collect_plan,
         _write_status,
     )
-    from my_deepagent.section_def import render_section_brief
+    from my_deepagent.section_def import check_delivery, render_section_brief
 
     def _log(msg: str) -> None:
         if verbose:
@@ -409,12 +459,20 @@ def run_writer_only(run_dir: str | Path, verbose: bool = True) -> str:
     report_path = run_dir / "report.md"
     report_path.write_text(report, encoding="utf-8")
 
+    delivery_validation = (
+        check_delivery(report, section)
+        if section
+        else {"complete": True, "deliverable_count": 0, "missing": []}
+    )
+    _atomic_write_json(run_dir / "delivery_validation.json", delivery_validation)
+
     has_incomplete = any(not complete for _, _, complete in findings)
     status = _apply_degraded(
         STATUS_COMPLETED_BY_WRITER,
         citation_validation.get("has_warnings", False),
         has_incomplete,
         None,
+        has_delivery_gaps=not delivery_validation["complete"],
     )
     _write_status(run_dir, status)
 
@@ -431,6 +489,7 @@ def run_writer_only(run_dir: str | Path, verbose: bool = True) -> str:
         "findings_count": len(findings),
         "has_incomplete_findings": has_incomplete,
         "citation_validation": citation_validation,
+        "delivery_validation": delivery_validation,
     })
     _atomic_write_json(metadata_path, metadata)
 

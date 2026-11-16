@@ -23,7 +23,7 @@ from my_deepagent.agent import build_agent
 from my_deepagent.citations import finalize_report_citations
 from my_deepagent.config import get_config
 from my_deepagent.cost import UsageCallback, UsageTracker, format_report, usage_scope
-from my_deepagent.section_def import load_section, render_section_brief
+from my_deepagent.section_def import check_delivery, load_section, render_section_brief
 from my_deepagent.writer import read_text, write_report
 
 
@@ -279,10 +279,11 @@ def _apply_degraded(
     has_warnings: bool,
     has_incomplete: bool,
     agent_error: str | None,
+    has_delivery_gaps: bool = False,
 ) -> str:
     """已成稿但存在证据/结构缺口时，将状态降级为 degraded。"""
     if status in (STATUS_COMPLETED, STATUS_COMPLETED_BY_WRITER):
-        if has_warnings or has_incomplete or agent_error:
+        if has_warnings or has_incomplete or agent_error or has_delivery_gaps:
             return STATUS_DEGRADED
     return status
 
@@ -391,9 +392,16 @@ async def run_research_task(task: dict | None = None) -> str:
         citation_validation,
     )
 
+    delivery_validation = check_delivery(report, section)
+    _atomic_write_json(run_dir / "delivery_validation.json", delivery_validation)
+
     has_incomplete = any(not complete for _, _, complete in findings)
     status = _apply_degraded(
-        status, citation_validation["has_warnings"], has_incomplete, agent_error
+        status,
+        citation_validation["has_warnings"],
+        has_incomplete,
+        agent_error,
+        has_delivery_gaps=not delivery_validation["complete"],
     )
 
     _write_status(run_dir, status)
@@ -408,6 +416,7 @@ async def run_research_task(task: dict | None = None) -> str:
         "findings_count": len(findings),
         "has_incomplete_findings": has_incomplete,
         "citation_validation": citation_validation,
+        "delivery_validation": delivery_validation,
     })
     _atomic_write_json(metadata_path, metadata)
 
