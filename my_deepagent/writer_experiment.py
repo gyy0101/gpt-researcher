@@ -1,18 +1,21 @@
-"""Writer 独立实验（Experiment A）。
+"""Writer 独立实验：比较原 Editorial+Writer 与增加论据克制规则后的效果。
 
-不运行 Chief Researcher / Researcher Subagent，不调用 quick_search / deep_research / RAG，
-只用已有运行目录（plan.md + findings/*.md）作为事实来源，验证 DeepSeek 的「观点提炼 + 写作」能力。
+本脚本只读取既有 run 目录中的 plan.md 和 findings/*.md：
+- 不启动 Researcher / Chief Researcher
+- 不调用 RAG、quick_search 或 deep_research
+- 不修改原始研究资料
 
-两种版本并行对比：
-- Version A（Direct）：一次性写作调用，直接生成最终报告 -> direct_report.md
-- Version B（Synthesis + Writer）：先提炼核心研究判断（research_synthesis.json），再据此 + 原始
-  Findings 写报告 -> synthesis_report.md
+推荐用法：
+    python writer_experiment_refactored.py --run-dir outputs/run_xxx --mode compare
+    python writer_experiment_refactored.py --run-dir outputs/run_xxx --mode v4
+    python writer_experiment_refactored.py --run-dir outputs/run_xxx --mode direct
 
-用法：
-    python writer_experiment.py --run-dir outputs/run_52a6c22b --mode both
-    python writer_experiment.py --run-dir outputs/run_52a6c22b --mode direct
-    python writer_experiment.py --run-dir outputs/run_52a6c22b --mode synthesis
+compare 模式只调用一次 Editorial Decision，然后将完全相同的输入分别交给
+V3 baseline Writer 和 V4 Writer。两者唯一有意改变的变量是写作规则。
 """
+
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json
@@ -20,272 +23,434 @@ import os
 import re
 import sys
 import time
+import uuid
+from pathlib import Path
+from typing import Any
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+# 保留原项目的导入方式
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from my_deepagent.config import get_config
 from my_deepagent.cost import get_usage_summary, reset_usage
 from my_deepagent.llm import chat, chat_json
 from my_deepagent.section_def import load_section, render_section_brief
 
-# ---- 模型生成参数（两组保持一致）----
+
+# ---------------------------------------------------------------------------
+# 配置
+# ---------------------------------------------------------------------------
+
+SCRIPT_VERSION = "1.0"
 TEMPERATURE = 0.3
 WRITER_MAX_TOKENS = 8000
-SYNTHESIS_MAX_TOKENS = 8000
-MAX_SYNTHESIS_RETRIES = 2
+EDITORIAL_MAX_TOKENS = 2500
+EDITORIAL_MAX_ATTEMPTS = 2
 
-# ---- 交付结构（任务文档「四、业务交付要求」）----
-TARGET_STRUCTURE = """最终报告结构要求（不必机械写成列表，但必须覆盖以下内容）：
+OUTPUT_DIR_NAME = "writer_experiment"
 
-## 动力电池行业
-- 供给：……
-- 需求：……
-- 总结：……
+# V3 baseline：保留原 V3 的主要写作约束，用于同输入对照。
+# 结构不在这里硬编码，统一由 Section Definition 提供。
+WRITER_V3_RULES = """## 写作要求
 
-## 储能电池行业
-- 供给：……
-- 需求：……
-- 总结：……
+### 信息取舍
+- 不追求信息覆盖率，不因为某个数据已经被检索到就认为必须写进去。
+- 一项信息只有在能解释核心判断、支撑重要结论或体现公司差异时，才进入正文。
+- 普通背景信息简略处理，无关信息直接舍弃。
+- 不同信息重要程度不同，篇幅不应平均分配。
 
-## 公司优势
-## 公司劣势
-## 行业对比
+### 数据使用
+- 数据用于支撑判断，不是填充文章。
+- 不罗列所有已找到的行业数据；相同结论不用多个相似指标反复证明。
+- 优先选择最有代表性、最有解释力的数据。
+- 保留关键年份、单位和统计口径。
 
-行业对比需要有关键数据，必要时使用一张精简的 Markdown 表格。"""
+### 语言表达
+- 直接表达事实和判断，不刻意创造专业概念。
+- 不强制每段设置观点标题，不强制每段做因果推演。
+- 不重复解释已经说清楚的内容；不追求段落对称、句式整齐。
+- 不写券商研报式的宏大叙事，不用空洞的总结性语言。
+- 一句话能表达的内容不写成一段。
 
-# ---- 目标风格（任务文档「五、人类研究员风格」）----
-STYLE_GUIDE = """目标风格（接近专业人类研究员的分析笔记，而非信息堆砌型报告）：
+### 分析重点
+- 不把历史数据罗列当成行业研究。
+- 优先识别行业过去发生了什么变化、当前最重要的供需矛盾、未来哪些因素可能改变格局、公司在行业变化中处于什么位置。
+- 不强制所有部分都包含完整过去/现在/未来分析，只有资料确实支持时才展开。
 
-1. 高信息密度：同一段内交代行业过去的变化、当前供需状态、导致变化的核心原因、未来可能发生什么、哪些条件会改变判断；不要逐条罗列所有资料。
-2. 判断优先：先给判断（例如「行业名义产能过剩与头部有效产能偏紧并存」），再用必要数据解释判断；不要把数据罗列完才在末尾给一句宽泛总结。
-3. 强调因果关系：解释规模如何影响单位制造成本、良率如何影响成本差异、技术迭代如何影响客户认证与产品溢价、海外布局如何改变竞争地位，而不是简单写「规模大、技术强、客户多」。
-4. 有前瞻性但不编造：允许基于历史事实和研究材料做有条件判断（如「若新增产能按计划释放，2027 年行业供需紧张程度可能下降」），但不得把券商预测或公司计划写成已发生的事实。
-5. 语言自然、简练：避免「在当前时代背景下」「充分彰显」「显著赋能」「构筑坚实护城河」「未来发展空间广阔」「机遇与挑战并存」等套话；不写长篇引言和总结套话。
-6. 不盲目模仿结论：根据证据判断一项现象属于竞争优势、竞争劣势、经营风险还是暂时性现象，而不是照抄模板结论。"""
+### 篇幅
+- 不设硬性字数，以研究员真正需要记录的信息量决定篇幅。
+- 不需要填满每个章节，不为达到某个字数而增加内容。
 
-# ---- 统一写作约束（任务文档「七、统一写作要求」）----
-UNIFIED_RULES = """统一写作约束（两组都必须遵守）：
+### 输出前检查
+在内部检查是否存在不必要的观点标题、数据堆砌、重复表达、无关背景、遗漏的重要信息或人为创造的概念。发现问题时优先删减和修正。
+不要输出检查过程，只输出最终报告。
 
-1. 必须覆盖动力、储能两个业务的供给、需求及总结。
-2. 必须分析公司优势、劣势和行业对比。
-3. 不追求覆盖 Findings 的全部内容。
-4. 优先选择对供需、价格、份额、盈利和未来竞争格局有解释力的内容。
-5. 区分事实、推断、预测。
-6. 保留必要引用：正文关键结论后用 [n] 编号标注来源，末尾附「来源」列表，只写券商研报或年报名称（不写页码、不写内部文件路径），不能伪造来源。
-7. 不得混用出货量、销量、装机量、使用量等统计口径。
-8. 数据有冲突时应说明，不能自行编造调和结果。
-9. 缺少重要证据时可以写明不确定性，但不要堆砌长篇缺口清单。
-10. 语言自然、紧凑，减少机械小标题和套话。
+### 数据与引用
+- 忠实于原始 Findings，不得编造事实、数据和来源。
+- 保留关键年份、单位和统计口径；口径不一致或数据冲突时显式说明。
+- 沿用原始研究资料中的引用编号及来源关系，不得自行创建引用编号。
+- 不得将研究资料中的推测改写为确定事实。
+- 如果 Findings 提供了来源编号与来源名称的对应关系，正文沿用该关系；不得猜测来源名称。
+- 如果原始资料提供了来源清单，报告末尾保留对应来源清单；只使用原始资料中可确认的来源名称，不输出内部文件路径。
+"""
 
-正文建议约 1,500–2,500 个汉字（非强制），如为保持重要判断和证据可略长。"""
+# V4：在 V3 的基础上，唯一重点新增“论据使用克制”规则。
+WRITER_V4_RULES = WRITER_V3_RULES + """
+### 论据使用与表达（本轮实验重点）
+- 论据是用来支撑判断的，不是用来展示研究成果的。不要把所有支持某个判断的资料都写进正文。
+- 一个判断优先选择最有代表性、最有解释力的一项事实或数据。
+- 其他论据只有在提供了不同维度的信息、揭示重要例外，或会改变读者对判断的理解时，才额外保留。
+- 如果多个数据只是重复证明同一个结论，选择其中最有解释力的一项，其余删除。
+- 不要在一句话后连续堆叠多个数字、案例、机制和来源。
+- 不要为了证明一个已经清楚的判断，再追加一整段同义论据。
+- 一个段落围绕一个主要表达任务展开；确实需要多项论据时，分清它们分别说明什么，不要挤进一个长句。
+- 不要机械地采用“观点 + 多个数据 + 原因机制 + 未来展望”的固定段落套路。
+- 重要问题可以展开，但展开应增加新的解释，而不是增加同一结论的重复证据。
+- 不要求每句话只出现一个数字，也不机械限制每个判断的论据数量；判断标准是新增论据是否带来新的信息价值。
+- 引用只对应实际使用的事实和判断，不为了显得资料丰富而堆叠引用。
+"""
+
+EDITORIAL_GUIDE = """你是公司研究员写作前的编辑助手。你不负责撰写报告，只负责帮助 Writer 判断哪些研究资料值得写、哪些可以删减。
+
+请基于 Section Definition、研究任务和 Findings，做简洁的编辑决策。
+
+重点回答：
+1. 核心问题：当前 Section 最值得读者关注的核心问题是什么？不要把行业规模、销量、市占率的罗列当成核心问题。
+2. 保留内容：哪些事实或判断直接支撑核心问题，或能体现公司与行业的关键差异？
+3. 重点展开：哪些问题需要解释原因、机制或未来变化？哪些内容一句话即可？
+4. 舍弃内容：哪些背景、重复数据、次要案例或低价值信息可以不写？
+5. 重要缺口：哪些缺失信息会实质影响核心判断？不要把一般性资料缺失都列为缺口。
+
+要求：
+- 不需要重新总结全部 Findings，不要写成一份缩小版研究报告。
+- 不设固定观点数量，不为了填满字段而创造内容。
+- 尽量用 Findings 中已有的文件名、引用编号或原文短语定位，不得编造定位。
+- 只做信息取舍与篇幅分配，不提前撰写正文。
+- 允许某个字段为空；如果没有重要缺口，important_gaps 返回空数组。
+- 输出必须是单个 JSON 对象，不要附加 Markdown 代码围栏或解释。
+
+JSON 结构：
+{
+  "core_issues": ["核心问题，简洁表达"],
+  "keep": ["值得保留的信息及其定位"],
+  "expand": ["值得展开的问题及原因"],
+  "brief": ["一句话即可说明的信息"],
+  "discard": ["建议舍弃的信息及原因"],
+  "important_gaps": ["确实影响核心判断的信息缺口"]
+}
+"""
 
 
-def _read_file(path: str) -> str:
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
+# ---------------------------------------------------------------------------
+# 文件与数据工具
+# ---------------------------------------------------------------------------
+
+def read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
 
 
-def _write_text(path: str, text: str):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
+def write_text(path: Path, content: str) -> None:
+    """原子写入，避免进程中断留下半个报告。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(content.rstrip() + "\n", encoding="utf-8")
+    temp_path.replace(path)
 
 
-def _write_json(path: str, obj):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+def write_json(path: Path, obj: Any) -> None:
+    write_text(path, json.dumps(obj, ensure_ascii=False, indent=2))
 
 
-def _sha256(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def _load_task() -> dict:
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "task.json")
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+def load_task(script_dir: Path) -> dict:
+    task_path = script_dir / "task.json"
+    if not task_path.is_file():
+        raise FileNotFoundError(
+            f"未找到 task.json：{task_path}。请将实验脚本放在原实验目录，"
+            "或按项目实际目录调整 task.json 的定位方式。"
+        )
+    with task_path.open("r", encoding="utf-8") as file:
+        task = json.load(file)
+    if not isinstance(task, dict):
+        raise ValueError("task.json 顶层必须是 JSON 对象")
+    return task
 
 
-def _build_task_context(task: dict, section: dict) -> str:
-    company = task.get("company", "")
-    period = task.get("report_period", "")
+def build_task_context(task: dict, section: dict) -> str:
+    company = str(task.get("company") or "").strip()
+    period = str(task.get("report_period") or "").strip()
+    section_name = str(section.get("name") or task.get("section_id") or "").strip()
+
+    if not company:
+        raise ValueError("task.json 缺少 company")
+    if not section_name:
+        raise ValueError("无法确定当前 Section 名称")
+
     brief = render_section_brief(section, company, period)
     return (
-        f"任务：为「{company}」撰写 {period} 年「{section.get('name', '')}」研究分析报告"
-        f"（目标风格：接近专业人类研究员、精简且有解释力的分析笔记，而非信息堆砌型报告）。\n\n{brief}"
+        f"研究对象：{company}\n"
+        f"报告期间：{period or '未指定'}\n"
+        f"当前 Section：{section_name}\n\n"
+        "以下 Section Definition 是本次交付范围和结构的依据。"
+        "请按其中实际定义的内容组织报告，不要套用其他行业或其他 Section 的固定模板。\n\n"
+        f"{brief}"
     )
 
 
-def _build_writing_spec() -> str:
-    return "\n\n".join([TARGET_STRUCTURE, STYLE_GUIDE, UNIFIED_RULES])
-
-
-def _render_findings(findings_dir: str, finding_files: list) -> str:
-    parts = []
-    for f in finding_files:
-        text = _read_file(os.path.join(findings_dir, f))
-        parts.append(f"===== findings/{f} =====\n{text}")
-    return "\n\n".join(parts)
-
-
-def _build_direct_prompt(task_context, writing_spec, plan_text, findings_text) -> str:
-    return (
-        f"{task_context}\n\n{writing_spec}\n\n"
-        f"下面是本次研究的计划（plan）与 Findings（事实与判断来源）：\n\n"
-        f"===== plan.md =====\n{plan_text}\n\n{findings_text}\n\n"
-        f"请基于上述 plan 与 Findings 撰写最终行业竞争分析报告，直接输出 Markdown 正文。"
+def render_findings(findings_dir: Path) -> tuple[list[Path], str]:
+    files = sorted(
+        path for path in findings_dir.glob("*.md")
+        if path.is_file() and not path.name.startswith(".")
     )
+    if not files:
+        raise ValueError(f"Findings 目录中没有可读取的 Markdown 文件：{findings_dir}")
+
+    parts: list[str] = []
+    for path in files:
+        content = read_text(path).strip()
+        if content:
+            parts.append(f"===== findings/{path.name} =====\n{content}")
+
+    if not parts:
+        raise ValueError("Findings 文件存在，但内容全部为空")
+
+    return files, "\n\n".join(parts)
 
 
-def _build_synthesis_prompt(task_context, findings_text) -> str:
-    return (
-        f"{task_context}\n\n"
-        f"下面是本次研究的 Findings（事实与判断来源）：\n\n{findings_text}\n\n"
-        f"请从 Findings 中提炼 8–12 条真正值得写进报告的核心研究判断"
-        f"（该数量是初始指导，不必强制凑满；有效观点更多或更少，请由你合理判断）。\n\n"
-        f"每条判断至少包含：所属业务及主题、核心判断、支持判断的关键事实、因果或经营机制、"
-        f"未来变化或判断条件、来源名称、重要性理由、不确定性及反面证据。\n\n"
-        f"只输出一个 JSON 对象，键为 core_judgments，值为观点对象数组。字段示例：\n"
-        f'{{"core_judgments": [{{"topic": "...", "thesis": "...", "supporting_facts": ["..."], '
-        f'"mechanism": "...", "outlook": "...", "importance_reason": "...", '
-        f'"source_refs": ["券商研报或年报名称"], "limitations": ["..."]}}]}}\n\n'
-        f"来源名称只写券商研报或年报名称（如「宁德时代 2025 年年报」「东吴证券研报」），"
-        f"不写页码、不写内部文件路径；不得伪造来源编号。"
-    )
+def build_input_manifest(
+    run_dir: Path,
+    plan_path: Path,
+    finding_files: list[Path],
+    task: dict,
+    model_name: str,
+    run_id: str,
+) -> dict:
+    inputs = []
+    task_path = Path(__file__).resolve().parent / "task.json"
+    source_paths = [plan_path, *finding_files]
+    if task_path.is_file():
+        source_paths.append(task_path)
+    for source_path in source_paths:
+        try:
+            display_path = str(source_path.relative_to(run_dir))
+            is_external = False
+        except ValueError:
+            # task.json 通常位于实验脚本目录，不一定位于 outputs/run_xxx 内。
+            display_path = str(source_path)
+            is_external = True
+        inputs.append({
+            "path": display_path,
+            "external_to_run_dir": is_external,
+            "sha256": sha256_file(source_path),
+            "size_bytes": source_path.stat().st_size,
+            "chars": len(read_text(source_path)),
+        })
 
-
-def _build_writer_b_prompt(task_context, writing_spec, findings_text, synthesis: dict) -> str:
-    synthesis_json = json.dumps(synthesis, ensure_ascii=False, indent=2)
-    return (
-        f"{task_context}\n\n{writing_spec}\n\n"
-        f"下面是第一步 Research Synthesis 提炼出的核心研究判断（观点提纲）：\n\n"
-        f"{synthesis_json}\n\n"
-        f"下面是原始 Findings（证据细节来源，可回查，不能只依赖上面的观点标题而丢失证据细节）：\n\n"
-        f"{findings_text}\n\n"
-        f"请基于上述 Research Synthesis 与 Findings 撰写最终行业竞争分析报告，直接输出 Markdown 正文。"
-    )
-
-
-def _extract_judgments(result) -> list:
-    """从 chat_json 的结果中提取观点对象列表，兼容多种键名与数组形态。"""
-    if isinstance(result, dict):
-        for key in ("core_judgments", "judgments", "points", "items"):
-            val = result.get(key)
-            if isinstance(val, list):
-                return [v for v in val if isinstance(v, dict)]
-        val = result.get("result")
-        if isinstance(val, list):
-            return [v for v in val if isinstance(v, dict)]
-    return []
-
-
-def _synthesize(task_context, findings_text) -> dict:
-    messages = [{"role": "user", "content": _build_synthesis_prompt(task_context, findings_text)}]
-    for attempt in range(1 + MAX_SYNTHESIS_RETRIES):
-        result = chat_json(messages, temperature=TEMPERATURE, max_tokens=SYNTHESIS_MAX_TOKENS)
-        judgments = _extract_judgments(result)
-        if judgments:
-            return {"core_judgments": judgments, "count": len(judgments)}
-        if attempt < MAX_SYNTHESIS_RETRIES:
-            messages.append(
-                {"role": "assistant", "content": json.dumps(result, ensure_ascii=False)[:2000]}
-            )
-            messages.append(
-                {
-                    "role": "user",
-                    "content": "上面的输出不是合法的 JSON 对象（或缺少 core_judgments 数组）。"
-                    "请只输出一个 JSON 对象，键为 core_judgments，值为观点对象数组。",
-                }
-            )
-    raise RuntimeError(
-        f"Research Synthesis 连续 {1 + MAX_SYNTHESIS_RETRIES} 次未能返回合法 JSON 观点列表，"
-        "请检查模型输出。"
-    )
-
-
-def _version_metrics(elapsed: float) -> dict:
     return {
-        "elapsed_seconds": round(elapsed, 2),
-        "usage": get_usage_summary(),
-    }
-
-
-def _run_direct(task_context, writing_spec, plan_text, findings_text, out_dir) -> dict:
-    reset_usage()
-    t0 = time.time()
-    prompt = _build_direct_prompt(task_context, writing_spec, plan_text, findings_text)
-    report = chat(
-        [{"role": "user", "content": prompt}],
-        temperature=TEMPERATURE,
-        max_tokens=WRITER_MAX_TOKENS,
-    )
-    elapsed = time.time() - t0
-    _write_text(os.path.join(out_dir, "direct_report.md"), report)
-    return _version_metrics(elapsed)
-
-
-def _run_synthesis_writer(task_context, writing_spec, findings_text, out_dir) -> dict:
-    reset_usage()
-    t0 = time.time()
-    synthesis = _synthesize(task_context, findings_text)
-    _write_json(os.path.join(out_dir, "research_synthesis.json"), synthesis)
-
-    prompt = _build_writer_b_prompt(task_context, writing_spec, findings_text, synthesis)
-    report = chat(
-        [{"role": "user", "content": prompt}],
-        temperature=TEMPERATURE,
-        max_tokens=WRITER_MAX_TOKENS,
-    )
-    elapsed = time.time() - t0
-    _write_text(os.path.join(out_dir, "synthesis_report.md"), report)
-    return _version_metrics(elapsed)
-
-
-def _build_manifest(run_dir, plan_path, plan_text, findings_dir, finding_files, task, cfg) -> dict:
-    inputs = [
-        {
-            "type": "plan",
-            "path": os.path.relpath(plan_path, run_dir),
-            "sha256": _sha256(plan_path),
-            "size_bytes": os.path.getsize(plan_path),
-            "chars": len(plan_text),
-        }
-    ]
-    total_chars = len(plan_text)
-    for f in finding_files:
-        p = os.path.join(findings_dir, f)
-        text = _read_file(p)
-        inputs.append(
-            {
-                "type": "finding",
-                "path": os.path.join("findings", f),
-                "sha256": _sha256(p),
-                "size_bytes": os.path.getsize(p),
-                "chars": len(text),
-            }
-        )
-        total_chars += len(text)
-    return {
-        "run_dir": run_dir,
+        "script_version": SCRIPT_VERSION,
+        "run_id": run_id,
+        "run_dir": str(run_dir),
         "company": task.get("company"),
         "report_period": task.get("report_period"),
         "section_id": task.get("section_id"),
-        "model_configured": cfg.deepseek_model,
+        "model_configured": model_name,
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "excluded_inputs": ["report.md（确定性兜底拼接结果，不作为事实来源）"],
         "inputs": inputs,
-        "total_chars": total_chars,
-        "truncation": "none（Findings 总量在模型上下文内，未截断）",
+        "total_input_chars": sum(item["chars"] for item in inputs),
+        # 这里只能确认脚本没有主动截断；不对模型服务端的上下文处理作无依据保证。
+        "script_truncated_input": False,
     }
 
 
-def _analyze(text: str) -> dict:
+# ---------------------------------------------------------------------------
+# Prompt 构造
+# ---------------------------------------------------------------------------
+
+def build_editorial_prompt(task_context: str, plan_text: str, findings_text: str) -> str:
+    return (
+        f"{task_context}\n\n"
+        "研究计划（仅用于理解研究范围，不是事实证据）：\n"
+        f"{plan_text}\n\n"
+        "原始 Findings（事实与判断的唯一依据）：\n"
+        f"{findings_text}\n\n"
+        f"{EDITORIAL_GUIDE}"
+    )
+
+
+def build_writer_prompt(
+    task_context: str,
+    rules: str,
+    plan_text: str,
+    findings_text: str,
+    editorial: dict | None = None,
+) -> str:
+    sections = [
+        task_context,
+        rules,
+        "研究计划（仅用于理解研究范围，不是事实证据）：\n" + plan_text,
+    ]
+
+    if editorial is not None:
+        sections.append(
+            "写作前编辑决策（用于控制信息取舍，不是事实来源）：\n"
+            "- core_issues：本节优先回答的问题。\n"
+            "- keep：优先保留的信息。\n"
+            "- expand：值得解释清楚的问题。\n"
+            "- brief：简要交代即可的信息。\n"
+            "- discard：默认不写；只有在发现其对核心判断不可或缺、或原决策遗漏了关键事实时才重新纳入。\n"
+            "- important_gaps：证据缺口，不得用推测补齐。\n"
+            "编辑决策不能覆盖原始 Findings；如发现决策遗漏了重要事实，可以回查补充，但不要因此重新罗列全部资料。\n\n"
+            + json.dumps(editorial, ensure_ascii=False, indent=2)
+        )
+
+    sections.append(
+        "原始 Findings（事实与判断的唯一依据）：\n" + findings_text
+    )
+    sections.append(
+        "请根据 Section Definition 完成最终报告。直接输出 Markdown 正文，"
+        "不要输出你的分析过程、编辑决策或自我评价。"
+    )
+    return "\n\n".join(sections)
+
+
+# ---------------------------------------------------------------------------
+# Editorial Decision
+# ---------------------------------------------------------------------------
+
+EDITORIAL_KEYS = (
+    "core_issues",
+    "keep",
+    "expand",
+    "brief",
+    "discard",
+    "important_gaps",
+)
+
+
+def normalize_editorial(result: Any) -> dict:
+    if not isinstance(result, dict):
+        raise ValueError("Editorial Decision 返回值不是 JSON 对象")
+
+    normalized: dict[str, list] = {}
+    for key in EDITORIAL_KEYS:
+        value = result.get(key, [])
+        if value is None:
+            value = []
+        if isinstance(value, str):
+            value = [value] if value.strip() else []
+        if not isinstance(value, list):
+            raise ValueError(f"Editorial Decision 字段 {key} 必须是数组")
+
+        # 保留字符串和对象，丢弃空字符串；不静默接受其他类型。
+        cleaned = []
+        for item in value:
+            if isinstance(item, str) and item.strip():
+                cleaned.append(item.strip())
+            elif isinstance(item, dict):
+                cleaned.append(item)
+            else:
+                raise ValueError(f"Editorial Decision 字段 {key} 包含不支持的元素")
+        normalized[key] = cleaned
+
+    if not any(normalized.values()):
+        raise ValueError("Editorial Decision 返回了空决策，不能继续假装实验成功")
+
+    return normalized
+
+
+def run_editorial(task_context: str, plan_text: str, findings_text: str) -> tuple[dict, dict]:
+    prompt = build_editorial_prompt(task_context, plan_text, findings_text)
+    messages = [{"role": "user", "content": prompt}]
+    last_error: Exception | None = None
+
+    reset_usage()
+    started = time.time()
+
+    for attempt in range(1, EDITORIAL_MAX_ATTEMPTS + 1):
+        try:
+            raw = chat_json(
+                messages,
+                temperature=TEMPERATURE,
+                max_tokens=EDITORIAL_MAX_TOKENS,
+            )
+            editorial = normalize_editorial(raw)
+            metrics = {
+                "elapsed_seconds": round(time.time() - started, 2),
+                "usage": get_usage_summary(),
+                "attempts": attempt,
+            }
+            return editorial, metrics
+        except Exception as exc:
+            last_error = exc
+            if attempt < EDITORIAL_MAX_ATTEMPTS:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "上次输出未通过 JSON 结构校验。请严格按要求返回单个 JSON 对象；"
+                        "所有字段均为数组，允许空数组，不要添加解释或 Markdown 围栏。"
+                    ),
+                })
+
+    raise RuntimeError(
+        f"Editorial Decision 连续 {EDITORIAL_MAX_ATTEMPTS} 次失败，已停止本次实验。"
+        f"最后错误：{last_error}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Writer 与指标
+# ---------------------------------------------------------------------------
+
+def run_writer(
+    task_context: str,
+    rules: str,
+    plan_text: str,
+    findings_text: str,
+    editorial: dict | None,
+    output_path: Path,
+) -> dict:
+    prompt = build_writer_prompt(
+        task_context=task_context,
+        rules=rules,
+        plan_text=plan_text,
+        findings_text=findings_text,
+        editorial=editorial,
+    )
+
+    reset_usage()
+    started = time.time()
+    report = chat(
+        [{"role": "user", "content": prompt}],
+        temperature=TEMPERATURE,
+        max_tokens=WRITER_MAX_TOKENS,
+    )
+    elapsed = time.time() - started
+
+    if not isinstance(report, str) or not report.strip():
+        raise RuntimeError(f"Writer 没有生成有效正文：{output_path.name}")
+
+    write_text(output_path, report)
+    return {
+        "elapsed_seconds": round(elapsed, 2),
+        "usage": get_usage_summary(),
+        "output": output_path.name,
+        "output_chars": len(report.strip()),
+        "output_sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),
+    }
+
+
+def analyze_report(text: str) -> dict:
     return {
         "chars": len(text.strip()),
-        "citations": len(re.findall(r"\[\d+\]|第\s*\d", text)),
+        "citations": len(re.findall(r"\[\d+\]", text)),
         "h1": len(re.findall(r"(?m)^#\s", text)),
         "h2": len(re.findall(r"(?m)^##\s", text)),
         "h3": len(re.findall(r"(?m)^###\s", text)),
@@ -293,131 +458,214 @@ def _analyze(text: str) -> dict:
     }
 
 
-def _write_comparison(out_dir):
-    direct_path = os.path.join(out_dir, "direct_report.md")
-    synth_path = os.path.join(out_dir, "synthesis_report.md")
-    lines = ["# Writer 实验对比（供人工评审）", ""]
+def write_comparison(
+    output_dir: Path,
+    baseline_path: Path,
+    v4_path: Path,
+    editorial: dict,
+) -> None:
+    baseline_text = read_text(baseline_path)
+    v4_text = read_text(v4_path)
+    baseline = analyze_report(baseline_text)
+    v4 = analyze_report(v4_text)
 
-    if not (os.path.isfile(direct_path) and os.path.isfile(synth_path)):
-        lines.append("（未生成全部报告，无法对比。请使用 --mode both 运行。）")
-        _write_text(os.path.join(out_dir, "comparison.md"), "\n".join(lines))
-        return
+    lines = [
+        "# Writer V3 / V4 对照（供人工评审）",
+        "",
+        "> 两个 Writer 使用同一份 Findings、Section Definition、研究计划和 Editorial Decision。"
+        "本轮重点观察论据使用约束对表达的影响；自动统计不代表质量评分。",
+        "",
+        f"- Editorial 核心问题：{len(editorial['core_issues'])} 条",
+        f"- 保留：{len(editorial['keep'])} 条",
+        f"- 重点展开：{len(editorial['expand'])} 条",
+        f"- 简要说明：{len(editorial['brief'])} 条",
+        f"- 舍弃：{len(editorial['discard'])} 条",
+        f"- 重要缺口：{len(editorial['important_gaps'])} 条",
+        "",
+        "| 指标 | V3 baseline | V4 论据克制 |",
+        "|---|---:|---:|",
+        f"| 正文字符数 | {baseline['chars']} | {v4['chars']} |",
+        f"| 引用标记数 | {baseline['citations']} | {v4['citations']} |",
+        f"| 一级标题数 | {baseline['h1']} | {v4['h1']} |",
+        f"| 二级标题数 | {baseline['h2']} | {v4['h2']} |",
+        f"| 三级标题数 | {baseline['h3']} | {v4['h3']} |",
+        f"| 表格行数 | {baseline['table_lines']} | {v4['table_lines']} |",
+        "",
+        f"- V3 报告：[{baseline_path.name}](./{baseline_path.name})",
+        f"- V4 报告：[{v4_path.name}](./{v4_path.name})",
+        "- 编辑决策：`editorial_decision_v4.json`",
+        "",
+        "请人工重点检查：同一判断是否减少了重复论据；是否仍保留关键事实；"
+        "是否把真正不同维度的证据错误删掉；语言是否更自然。",
+    ]
+    write_text(output_dir / "comparison_v4.md", "\n".join(lines))
 
-    d = _analyze(_read_file(direct_path))
-    s = _analyze(_read_file(synth_path))
-    lines.extend(
-        [
-            "> 说明：以下仅为本实验自动统计的结构性指标，**引用数量/字数多少不等同于质量高低**，"
-            "仅供人工评审时参考。",
-            "",
-            "| 指标 | Version A (Direct) | Version B (Synthesis+Writer) |",
-            "|---|---|---|",
-            f"| 保存位置 | direct_report.md | synthesis_report.md |",
-            f"| 正文字符数 | {d['chars']} | {s['chars']} |",
-            f"| 引用/页码标记数 | {d['citations']} | {s['citations']} |",
-            f"| 一级标题数 | {d['h1']} | {s['h1']} |",
-            f"| 二级标题数 | {d['h2']} | {s['h2']} |",
-            f"| 三级标题数 | {d['h3']} | {s['h3']} |",
-            f"| 表格行数 | {d['table_lines']} | {s['table_lines']} |",
-            "",
-            "## 两版文本",
-            "",
-            "### Version A：direct_report.md",
-            f"见 [direct_report.md](./direct_report.md)（{d['chars']} 字符）",
-            "",
-            "### Version B：synthesis_report.md",
-            f"见 [synthesis_report.md](./synthesis_report.md)（{s['chars']} 字符）",
-            "",
-            "核心观点清单见 [research_synthesis.json](./research_synthesis.json)。",
-        ]
+
+def usage_summary_line(label: str, metrics: dict) -> None:
+    usage = metrics.get("usage", {}).get("total", {})
+    print(
+        f"[{label}] {metrics.get('elapsed_seconds', 0)}s | "
+        f"calls={usage.get('calls', 0)} | "
+        f"input={usage.get('prompt_tokens', 0):,} | "
+        f"output={usage.get('completion_tokens', 0):,} | "
+        f"cost={usage.get('cost_current', 0):.4f}"
     )
-    _write_text(os.path.join(out_dir, "comparison.md"), "\n".join(lines))
 
 
-def _print_usage(label: str, metrics: dict):
-    usage = metrics["usage"]
-    total = usage["total"]
-    print(f"[{label}] 耗时 {metrics['elapsed_seconds']}s | 调用 {total['calls']} 次 | "
-          f"输入 {total['prompt_tokens']:,} tokens（缓存命中 {total['cache_hit_tokens']:,} / "
-          f"未命中 {total['cache_miss_tokens']:,}）| 输出 {total['completion_tokens']:,} tokens | "
-          f"费用 ¥{total['cost_current']:.4f}（{usage['period_label']}时段）")
+# ---------------------------------------------------------------------------
+# 实验运行
+# ---------------------------------------------------------------------------
 
+def run(run_dir_arg: str, mode: str) -> None:
+    run_dir = Path(run_dir_arg).expanduser().resolve()
+    plan_path = run_dir / "plan.md"
+    findings_dir = run_dir / "findings"
 
-def run(run_dir_arg: str, mode: str):
-    run_dir = os.path.abspath(run_dir_arg)
-    plan_path = os.path.join(run_dir, "plan.md")
-    findings_dir = os.path.join(run_dir, "findings")
-    if not os.path.isdir(run_dir):
+    if not run_dir.is_dir():
         raise SystemExit(f"运行目录不存在：{run_dir}")
-    if not os.path.isfile(plan_path):
+    if not plan_path.is_file():
         raise SystemExit(f"未找到 plan.md：{plan_path}")
-    if not os.path.isdir(findings_dir):
+    if not findings_dir.is_dir():
         raise SystemExit(f"未找到 findings 目录：{findings_dir}")
 
     cfg = get_config()
-    if not cfg.deepseek_api_key:
+    if not getattr(cfg, "deepseek_api_key", None):
         raise SystemExit("缺少 DEEPSEEK_API_KEY，请在 .env 或环境变量中配置")
 
-    out_dir = os.path.join(run_dir, "writer_experiment")
-    os.makedirs(out_dir, exist_ok=True)
-    print(f"输出目录：{out_dir}")
+    script_dir = Path(__file__).resolve().parent
+    task = load_task(script_dir)
+    section_id = task.get("section_id") or "industry_competition"
+    section = load_section(section_id)
 
-    task = _load_task()
-    section = load_section(task.get("section_id", "industry_competition"))
-    task_context = _build_task_context(task, section)
-    writing_spec = _build_writing_spec()
+    task_context = build_task_context(task, section)
+    plan_text = read_text(plan_path).strip()
+    if not plan_text:
+        raise SystemExit(f"plan.md 为空：{plan_path}")
 
-    finding_files = sorted(f for f in os.listdir(findings_dir) if f.endswith(".md"))
-    plan_text = _read_file(plan_path)
-    findings_text = _render_findings(findings_dir, finding_files)
-    print(f"读取 plan.md + {len(finding_files)} 份 findings（合计 {len(plan_text) + len(findings_text):,} 字符），"
-          f"未读取 report.md")
+    finding_files, findings_text = render_findings(findings_dir)
+    output_dir = run_dir / OUTPUT_DIR_NAME
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    manifest = _build_manifest(run_dir, plan_path, plan_text, findings_dir, finding_files, task, cfg)
-    _write_json(os.path.join(out_dir, "input_manifest.json"), manifest)
+    run_id = uuid.uuid4().hex[:12]
+    manifest = build_input_manifest(
+        run_dir, plan_path, finding_files, task, cfg.deepseek_model, run_id
+    )
+    write_json(output_dir / "input_manifest.json", manifest)
 
-    metrics = {
+    print(f"输出目录：{output_dir}")
+    print(f"本次 run_id：{run_id}")
+    print(
+        f"输入：plan.md + {len(finding_files)} 份 Findings，"
+        f"共 {manifest['total_input_chars']:,} 字符；脚本未主动截断输入。"
+    )
+    print(f"模式：{mode}")
+
+    metrics: dict[str, Any] = {
+        "script_version": SCRIPT_VERSION,
+        "run_id": run_id,
         "model_configured": cfg.deepseek_model,
         "temperature": TEMPERATURE,
         "writer_max_tokens": WRITER_MAX_TOKENS,
-        "synthesis_max_tokens": SYNTHESIS_MAX_TOKENS,
+        "editorial_max_tokens": EDITORIAL_MAX_TOKENS,
         "versions": {},
+        "generated_artifacts": [],
     }
 
-    if mode in ("direct", "both"):
-        print("\n=== Version A（Direct Writer）===")
-        metrics["versions"]["direct"] = _run_direct(
-            task_context, writing_spec, plan_text, findings_text, out_dir
+    def run_direct_baseline() -> None:
+        print("\n=== Direct Writer（无 Editorial 对照）===")
+        result = run_writer(
+            task_context=task_context,
+            rules=WRITER_V3_RULES,
+            plan_text=plan_text,
+            findings_text=findings_text,
+            editorial=None,
+            output_path=output_dir / "direct_report_no_editorial.md",
         )
-        _print_usage("Version A", metrics["versions"]["direct"])
+        metrics["versions"]["direct_no_editorial"] = result
+        metrics["generated_artifacts"].append(result["output"])
+        usage_summary_line("Direct（无 Editorial）", result)
 
-    if mode in ("synthesis", "both"):
-        print("\n=== Version B（Synthesis + Writer）===")
-        metrics["versions"]["synthesis"] = _run_synthesis_writer(
-            task_context, writing_spec, findings_text, out_dir
+    if mode == "direct":
+        run_direct_baseline()
+
+    elif mode in ("v4", "both", "compare"):
+        # Editorial 只运行一次，compare 时 V3/V4 共用同一份决策。
+        print("\n=== Editorial Decision ===")
+        editorial, editorial_metrics = run_editorial(
+            task_context, plan_text, findings_text
         )
-        _print_usage("Version B", metrics["versions"]["synthesis"])
+        write_json(output_dir / "editorial_decision_v4.json", editorial)
+        metrics["editorial"] = editorial_metrics
+        metrics["generated_artifacts"].append("editorial_decision_v4.json")
+        usage_summary_line("Editorial", editorial_metrics)
 
-    _write_json(os.path.join(out_dir, "run_metrics.json"), metrics)
-    _write_comparison(out_dir)
+        if mode == "compare":
+            print("\n=== V3 baseline Writer（与 V4 共用 Editorial）===")
+            v3_result = run_writer(
+                task_context,
+                WRITER_V3_RULES,
+                plan_text,
+                findings_text,
+                editorial,
+                output_dir / "direct_report_v3_baseline.md",
+            )
+            metrics["versions"]["v3_baseline"] = v3_result
+            metrics["generated_artifacts"].append(v3_result["output"])
+            usage_summary_line("V3 baseline", v3_result)
 
-    print(f"\n[完成] 输出目录：{out_dir}")
-    for f in ("direct_report.md", "research_synthesis.json", "synthesis_report.md",
-              "run_metrics.json", "comparison.md", "input_manifest.json"):
-        if os.path.isfile(os.path.join(out_dir, f)):
-            print(f"  - {f}")
+        print("\n=== V4 Writer（增加论据克制规则）===")
+        v4_result = run_writer(
+            task_context,
+            WRITER_V4_RULES,
+            plan_text,
+            findings_text,
+            editorial,
+            output_dir / "direct_report_v4.md",
+        )
+        metrics["versions"]["v4"] = v4_result
+        metrics["generated_artifacts"].append(v4_result["output"])
+        usage_summary_line("V4", v4_result)
+
+        if mode == "compare":
+            write_comparison(
+                output_dir,
+                output_dir / "direct_report_v3_baseline.md",
+                output_dir / "direct_report_v4.md",
+                editorial,
+            )
+            metrics["generated_artifacts"].append("comparison_v4.md")
+
+        if mode == "both":
+            run_direct_baseline()
+
+    else:
+        raise ValueError(f"不支持的运行模式：{mode}")
+
+    metrics["generated_artifacts"].append("run_metrics.json")
+    write_json(output_dir / "run_metrics.json", metrics)
+    print("\n[完成] 本次实际生成的文件：")
+    for name in metrics["generated_artifacts"]:
+        print(f"  - {name}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Writer 独立实验（Experiment A）")
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Writer 独立实验：V3 baseline / V4 论据克制对照"
+    )
     parser.add_argument(
-        "--run-dir", required=True, help="已有运行目录，如 outputs/run_52a6c22b"
+        "--run-dir",
+        required=True,
+        help="已有研究运行目录，例如 outputs/run_xxx",
     )
     parser.add_argument(
         "--mode",
-        choices=["direct", "synthesis", "both"],
-        default="both",
-        help="运行哪个版本（默认 both）",
+        choices=("direct", "v4", "both", "compare"),
+        default="compare",
+        help=(
+            "direct：只跑 Direct baseline；v4：Editorial + V4；"
+            "both：Direct（无 Editorial）+ Editorial/V4；"
+            "compare：同一 Editorial 下对比 V3 baseline 与 V4（推荐）"
+        ),
     )
     args = parser.parse_args()
     run(args.run_dir, args.mode)

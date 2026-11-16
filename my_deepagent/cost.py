@@ -1,21 +1,24 @@
-"""DeepSeek token 用量统计与费用计算（元 / 百万 tokens 计费）。
+"""Token 统计与费用估算。
 
-费率表（来源：DeepSeek API 官方定价，峰谷定价于 2026-08-17 起生效）：
-- 高峰时段：北京时间周一至周五（不含中国法定节假日）9:00-12:00、14:00-18:00。
-- 空闲时段：其余时间，价格为高峰时段的一半。
-
-本模块同时统计两条 DeepSeek 调用路径的 token：
-1. `llm.py` 直接 HTTP 调用（工具内部 query 规划与合成），经 `record_usage` 记录；
-2. LangChain `init_chat_model` 的 Agent 调用（Chief Researcher / researcher 子 agent），
-   经 `UsageCallback`（LangChain 回调）记录。
+未知模型不会被错误归入旗舰模型费率；费用无法确认时明确标记为未配置。
+峰谷判断暂按工作日时段计算，未接入中国法定节假日日历。
 """
+from __future__ import annotations
+
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime, timedelta, time, timezone
+from datetime import datetime, time, timedelta, timezone
+from typing import Any, Iterator
 
-from langchain_core.callbacks import BaseCallbackHandler
+try:
+    from langchain_core.callbacks import BaseCallbackHandler
+except ImportError:  # 允许不安装 LangChain 的纯工具单元测试导入本模块
+    class BaseCallbackHandler:  # type: ignore[no-redef]
+        pass
 
-# 每百万 tokens 价格（元）。空闲时段 = 高峰时段的一半。
+# 保留项目原有费率表；使用前请核对 DeepSeek 当前官方价格。
 PRICING = {
     "deepseek-flash": {
         "peak": {"cache_hit": 0.04, "cache_miss": 2.0, "output": 8.0},
@@ -26,226 +29,345 @@ PRICING = {
         "off_peak": {"cache_hit": 0.15, "cache_miss": 4.5, "output": 13.5},
     },
 }
-
-# 北京时间时区
 _BEIJING = timezone(timedelta(hours=8))
 
 
-def _tier(model: str) -> str:
-    """按模型名映射到费率档位。flash 系列走 flash 档，其余按旗舰档（v4-pro）计费。"""
-    m = (model or "").lower()
-    if "flash" in m:
+def _resolve_tier(model: str, configured: str | None = None) -> str | None:
+    configured = (configured or "auto").lower()
+    if configured in PRICING:
+        return configured
+    if configured not in {"", "auto"}:
+        return None
+
+    name = (model or "").lower()
+    if "flash" in name:
         return "deepseek-flash"
-    return "deepseek-v4-pro"
+    if "v4-pro" in name:
+        return "deepseek-v4-pro"
+    # 不再把 deepseek-chat 等未知模型默认按 V4 Pro 计费。
+    return None
 
 
 def is_peak_time(dt: datetime | None = None) -> bool:
-    """判断是否为高峰时段（北京时间周一至周五 9:00-12:00、14:00-18:00）。
-
-    未实现中国法定节假日判断（需要外部日历），默认按工作日处理。
-    """
     bj = (dt if dt is not None else datetime.now(timezone.utc)).astimezone(_BEIJING)
-    if bj.weekday() >= 5:  # 周六 / 周日
+    if bj.weekday() >= 5:
         return False
-    t = bj.time()
-    return (time(9, 0) <= t < time(12, 0)) or (time(14, 0) <= t < time(18, 0))
+    current = bj.time()
+    return (time(9, 0) <= current < time(12, 0)) or (
+        time(14, 0) <= current < time(18, 0)
+    )
 
 
 def period_label(dt: datetime | None = None) -> str:
     return "高峰" if is_peak_time(dt) else "空闲"
 
 
+def _as_dict(value: Any) -> dict:
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "model_dump"):
+        try:
+            result = value.model_dump()
+            return result if isinstance(result, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _extract(usage: dict) -> tuple[int, int, int, int]:
+    usage = _as_dict(usage)
+    if not usage:
+        return 0, 0, 0, 0
+
+    prompt = usage.get("prompt_tokens")
+    if prompt is None:
+        prompt = usage.get("input_tokens", 0)
+    completion = usage.get("completion_tokens")
+    if completion is None:
+        completion = usage.get("output_tokens", 0)
+
+    details = _as_dict(
+        usage.get("prompt_tokens_details") or usage.get("input_token_details")
+    )
+    hit = usage.get("prompt_cache_hit_tokens")
+    if hit is None:
+        hit = details.get("cached_tokens")
+    if hit is None:
+        hit = details.get("cache_read", 0)
+
+    miss = usage.get("prompt_cache_miss_tokens")
+    if miss is None:
+        miss = max(int(prompt or 0) - int(hit or 0), 0)
+
+    prompt = max(int(prompt or 0), 0)
+    completion = max(int(completion or 0), 0)
+    hit = min(max(int(hit or 0), 0), prompt)
+    miss = max(int(miss or 0), 0)
+    # 如果服务端给出的 hit/miss 之和异常，优先以 prompt-hit 兜底。
+    if hit + miss != prompt:
+        miss = max(prompt - hit, 0)
+    return prompt, completion, hit, miss
+
+
 @dataclass
-class _Usage:
+class Usage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cache_hit_tokens: int = 0
     cache_miss_tokens: int = 0
     calls: int = 0
+    pricing_tier: str | None = None
 
 
-def _extract(usage: dict) -> tuple[int, int, int, int]:
-    """从不同来源的 usage 结构中提取 (输入, 输出, 缓存命中, 缓存未命中)。"""
-    if not usage:
-        return 0, 0, 0, 0
-    prompt = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
-    completion = usage.get("completion_tokens") or usage.get("output_tokens") or 0
-    hit = usage.get("prompt_cache_hit_tokens")
-    if hit is None:
-        details = (
-            usage.get("prompt_tokens_details")
-            or usage.get("input_token_details")
-            or {}
-        )
-        hit = details.get("cached_tokens") or details.get("cache_read") or 0
-    miss = usage.get("prompt_cache_miss_tokens")
-    if miss is None:
-        miss = max((prompt or 0) - (hit or 0), 0)
-    return int(prompt or 0), int(completion or 0), int(hit or 0), int(miss or 0)
+class UsageTracker:
+    """单次运行独立的线程安全用量统计器。"""
 
-
-class _Tracker:
     def __init__(self):
-        self._lock = threading.Lock()
-        self._per_model: dict[str, _Usage] = {}
+        self._lock = threading.RLock()
+        self._per_model: dict[str, Usage] = {}
 
-    def record(self, model: str, usage: dict):
+    def record(self, model: str, usage: dict, pricing_tier: str | None = None) -> None:
         prompt, completion, hit, miss = _extract(usage)
         if prompt == 0 and completion == 0:
             return
-        with self._lock:
-            u = self._per_model.setdefault(model or "unknown", _Usage())
-            u.prompt_tokens += prompt
-            u.completion_tokens += completion
-            u.cache_hit_tokens += hit
-            u.cache_miss_tokens += miss
-            u.calls += 1
 
-    def reset(self):
+        model_name = model or "unknown"
+        tier = _resolve_tier(model_name, pricing_tier)
+        with self._lock:
+            current = self._per_model.setdefault(model_name, Usage(pricing_tier=tier))
+            if current.pricing_tier != tier:
+                current.pricing_tier = None
+            current.prompt_tokens += prompt
+            current.completion_tokens += completion
+            current.cache_hit_tokens += hit
+            current.cache_miss_tokens += miss
+            current.calls += 1
+
+    def reset(self) -> None:
         with self._lock:
             self._per_model.clear()
 
-    def snapshot(self) -> dict[str, _Usage]:
+    def snapshot(self) -> dict[str, Usage]:
         with self._lock:
-            return {k: _Usage(v.prompt_tokens, v.completion_tokens, v.cache_hit_tokens, v.cache_miss_tokens, v.calls) for k, v in self._per_model.items()}
+            return {
+                name: Usage(
+                    prompt_tokens=value.prompt_tokens,
+                    completion_tokens=value.completion_tokens,
+                    cache_hit_tokens=value.cache_hit_tokens,
+                    cache_miss_tokens=value.cache_miss_tokens,
+                    calls=value.calls,
+                    pricing_tier=value.pricing_tier,
+                )
+                for name, value in self._per_model.items()
+            }
 
 
-_tracker = _Tracker()
+_DEFAULT_TRACKER = UsageTracker()
+_CURRENT_TRACKER: ContextVar[UsageTracker | None] = ContextVar(
+    "deepagent_usage_tracker", default=None
+)
 
 
-def record_usage(model: str, usage: dict):
-    """记录一次 DeepSeek 调用的 token 用量（供 llm.py 直接 HTTP 路径调用）。"""
-    _tracker.record(model, usage)
+@contextmanager
+def usage_scope(tracker: UsageTracker) -> Iterator[UsageTracker]:
+    """把直接 HTTP 调用与 LangChain 回调绑定到同一次运行的统计器。"""
+    token = _CURRENT_TRACKER.set(tracker)
+    try:
+        yield tracker
+    finally:
+        _CURRENT_TRACKER.reset(token)
 
 
-def reset_usage():
-    _tracker.reset()
+def _active_tracker() -> UsageTracker:
+    return _CURRENT_TRACKER.get() or _DEFAULT_TRACKER
 
 
-def get_usage() -> dict[str, _Usage]:
-    return _tracker.snapshot()
+def record_usage(
+    model: str, usage: dict, pricing_tier: str | None = None
+) -> None:
+    _active_tracker().record(model, usage, pricing_tier)
 
 
-def get_usage_summary() -> dict:
-    """返回可 JSON 序列化的用量与费用汇总（供外部脚本记录指标）。"""
-    snapshot = _tracker.snapshot()
+def reset_usage() -> None:
+    _DEFAULT_TRACKER.reset()
+
+
+def get_usage() -> dict[str, Usage]:
+    return _active_tracker().snapshot()
+
+
+def _cost(usage: Usage, period: str) -> float | None:
+    if not usage.pricing_tier or usage.pricing_tier not in PRICING:
+        return None
+    rates = PRICING[usage.pricing_tier][period]
+    return (
+        usage.cache_hit_tokens / 1_000_000 * rates["cache_hit"]
+        + usage.cache_miss_tokens / 1_000_000 * rates["cache_miss"]
+        + usage.completion_tokens / 1_000_000 * rates["output"]
+    )
+
+
+def estimate_cost(
+    prompt_tokens: int,
+    completion_tokens: int,
+    model: str,
+    pricing_tier: str | None = None,
+) -> float | None:
+    """按峰值费率保守估算单次调用的费用上界；未知模型返回 None。
+
+    输入 token 统一按 cache_miss 峰值、输出 token 按 output 峰值计算，
+    作为预算预留的费用上界。模型未匹配明确费率时返回 None，调用方不应
+    据此触发费用硬约束。
+    """
+    tier = _resolve_tier(model, pricing_tier)
+    if not tier or tier not in PRICING:
+        return None
+    rates = PRICING[tier]["peak"]
+    return (
+        max(int(prompt_tokens), 0) / 1_000_000 * rates["cache_miss"]
+        + max(int(completion_tokens), 0) / 1_000_000 * rates["output"]
+    )
+
+
+def get_usage_summary(tracker: UsageTracker | None = None) -> dict:
+    snapshot = (tracker or _active_tracker()).snapshot()
     now_bj = datetime.now(timezone.utc).astimezone(_BEIJING)
-    cur_period = "peak" if is_peak_time(now_bj) else "off_peak"
+    current_period = "peak" if is_peak_time(now_bj) else "off_peak"
 
     models = {}
-    for model, u in snapshot.items():
-        tier = _tier(model)
+    for model, usage in snapshot.items():
         models[model] = {
-            "tier": tier,
-            "calls": u.calls,
-            "prompt_tokens": u.prompt_tokens,
-            "completion_tokens": u.completion_tokens,
-            "cache_hit_tokens": u.cache_hit_tokens,
-            "cache_miss_tokens": u.cache_miss_tokens,
-            "cost_current": round(_cost(u, tier, cur_period), 6),
-            "cost_peak": round(_cost(u, tier, "peak"), 6),
-            "cost_off_peak": round(_cost(u, tier, "off_peak"), 6),
+            "tier": usage.pricing_tier,
+            "calls": usage.calls,
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "cache_hit_tokens": usage.cache_hit_tokens,
+            "cache_miss_tokens": usage.cache_miss_tokens,
+            "cost_current": _cost(usage, current_period),
+            "cost_peak": _cost(usage, "peak"),
+            "cost_off_peak": _cost(usage, "off_peak"),
         }
 
-    def _sum(field):
-        return sum(getattr(u, field) for u in snapshot.values())
+    all_priced = all(item.pricing_tier for item in snapshot.values())
+    current_partial = sum(
+        _cost(item, current_period) or 0.0 for item in snapshot.values()
+    )
+    peak_partial = sum(_cost(item, "peak") or 0.0 for item in snapshot.values())
+    off_peak_partial = sum(_cost(item, "off_peak") or 0.0 for item in snapshot.values())
+
+    def total(field: str) -> int:
+        return sum(getattr(item, field) for item in snapshot.values())
 
     return {
-        "period": cur_period,
+        "period": current_period,
         "period_label": period_label(now_bj),
         "models": models,
         "total": {
-            "calls": _sum("calls"),
-            "prompt_tokens": _sum("prompt_tokens"),
-            "completion_tokens": _sum("completion_tokens"),
-            "cache_hit_tokens": _sum("cache_hit_tokens"),
-            "cache_miss_tokens": _sum("cache_miss_tokens"),
-            "cost_current": round(
-                sum(_cost(u, _tier(m), cur_period) for m, u in snapshot.items()), 6
-            ),
-            "cost_peak": round(
-                sum(_cost(u, _tier(m), "peak") for m, u in snapshot.items()), 6
-            ),
-            "cost_off_peak": round(
-                sum(_cost(u, _tier(m), "off_peak") for m, u in snapshot.items()), 6
-            ),
+            "calls": total("calls"),
+            "prompt_tokens": total("prompt_tokens"),
+            "completion_tokens": total("completion_tokens"),
+            "cache_hit_tokens": total("cache_hit_tokens"),
+            "cache_miss_tokens": total("cache_miss_tokens"),
+            "cost_complete": all_priced,
+            "unpriced_models": [
+                name for name, item in snapshot.items() if not item.pricing_tier
+            ],
+            "cost_current": current_partial if all_priced else None,
+            "cost_peak": peak_partial if all_priced else None,
+            "cost_off_peak": off_peak_partial if all_priced else None,
+            "cost_current_partial": round(current_partial, 6),
+            "cost_peak_partial": round(peak_partial, 6),
+            "cost_off_peak_partial": round(off_peak_partial, 6),
         },
     }
 
 
 class UsageCallback(BaseCallbackHandler):
-    """LangChain 回调：捕获 Agent（Chief Researcher / researcher 子 agent）的 token 用量。"""
+    """记录 LangChain Agent 调用；与直接 HTTP 调用共享同一 Tracker。"""
 
-    def on_llm_end(self, response, **kwargs):
+    def __init__(
+        self,
+        tracker: UsageTracker | None = None,
+        pricing_tier: str = "auto",
+    ):
+        self.tracker = tracker
+        self.pricing_tier = pricing_tier
+
+    def on_llm_end(self, response, **kwargs) -> None:
         llm_output = getattr(response, "llm_output", None) or {}
+        llm_output = _as_dict(llm_output)
         usage = llm_output.get("token_usage")
         model = llm_output.get("model_name") or ""
+
         if not usage:
-            # 回退：从消息的 usage_metadata 提取（部分版本不放 llm_output["token_usage"]）
             try:
-                msg = getattr(response.generations[0][0], "message", None)
-                um = getattr(msg, "usage_metadata", None) or {}
-                if um:
+                message = response.generations[0][0].message
+                metadata = _as_dict(getattr(message, "usage_metadata", None))
+                if metadata:
+                    details = _as_dict(metadata.get("input_token_details"))
                     usage = {
-                        "input_tokens": um.get("input_tokens", 0),
-                        "output_tokens": um.get("output_tokens", 0),
-                        "input_token_details": um.get("input_token_details", {}),
+                        "input_tokens": metadata.get("input_tokens", 0),
+                        "output_tokens": metadata.get("output_tokens", 0),
+                        "input_token_details": details,
                     }
-                    model = model or (getattr(msg, "response_metadata", None) or {}).get(
-                        "model_name", ""
-                    )
+                response_metadata = _as_dict(
+                    getattr(message, "response_metadata", None)
+                )
+                model = model or response_metadata.get("model_name", "")
             except Exception:
                 usage = None
+
         if not usage:
             return
-        _tracker.record(model, usage)
+
+        tracker = self.tracker or _active_tracker()
+        tracker.record(model, usage, self.pricing_tier)
 
 
-def _cost(u: _Usage, tier: str, period: str) -> float:
-    rates = PRICING[tier][period]
-    return (
-        u.cache_hit_tokens / 1e6 * rates["cache_hit"]
-        + u.cache_miss_tokens / 1e6 * rates["cache_miss"]
-        + u.completion_tokens / 1e6 * rates["output"]
-    )
+def format_report(tracker: UsageTracker | None = None) -> str:
+    summary = get_usage_summary(tracker)
+    total = summary["total"]
+    lines = [
+        "==================== Token 用量与费用 ====================",
+        f"统计时段（北京时间）: {summary['period_label']}",
+        "",
+    ]
 
-
-def format_report() -> str:
-    """生成 token 用量与费用的可读汇总文本。"""
-    snapshot = _tracker.snapshot()
-    now_bj = datetime.now(timezone.utc).astimezone(_BEIJING)
-    cur_period = "peak" if is_peak_time(now_bj) else "off_peak"
-
-    lines = ["==================== Token 用量与费用 ===================="]
-    lines.append(f"统计时刻（北京时间）: {now_bj:%Y-%m-%d %H:%M:%S}（{period_label(now_bj)}时段）")
-    lines.append("")
-
-    total_current = 0.0
-    total_peak = 0.0
-    for model, u in snapshot.items():
-        tier = _tier(model)
-        cur_cost = _cost(u, tier, cur_period)
-        peak_cost = _cost(u, tier, "peak")
-        off_cost = _cost(u, tier, "off_peak")
-        total_current += cur_cost
-        total_peak += peak_cost
-
-        lines.append(f"[{model}]（费率档位: {tier.replace('deepseek-', '')}）")
-        lines.append(f"  调用次数      : {u.calls}")
-        lines.append(
-            f"  输入 tokens   : {u.prompt_tokens:,}（缓存命中 {u.cache_hit_tokens:,} / 未命中 {u.cache_miss_tokens:,}）"
-        )
-        lines.append(f"  输出 tokens   : {u.completion_tokens:,}")
-        lines.append(f"  费用（当前·{period_label(now_bj)}）: ¥{cur_cost:.4f}")
-        lines.append(f"  费用（空闲参考）: ¥{off_cost:.4f}　（高峰参考）: ¥{peak_cost:.4f}")
+    for model, item in summary["models"].items():
+        lines.extend([
+            f"[{model}]（费率档位: {item['tier'] or '未配置'}）",
+            f"  调用次数      : {item['calls']}",
+            (
+                f"  输入 tokens   : {item['prompt_tokens']:,}"
+                f"（缓存命中 {item['cache_hit_tokens']:,} / "
+                f"未命中 {item['cache_miss_tokens']:,}）"
+            ),
+            f"  输出 tokens   : {item['completion_tokens']:,}",
+        ])
+        if item["cost_current"] is None:
+            lines.append("  费用          : 未估算（当前模型未匹配明确费率）")
+        else:
+            lines.append(f"  当前时段费用  : ¥{item['cost_current']:.4f}")
+            lines.append(
+                f"  空闲/高峰参考 : ¥{item['cost_off_peak']:.4f} / "
+                f"¥{item['cost_peak']:.4f}"
+            )
         lines.append("")
 
     lines.append("-" * 52)
-    lines.append(f"合计（当前·{period_label(now_bj)}时段）: ¥{total_current:.4f}")
-    lines.append(f"合计（若全程高峰时段）        : ¥{total_peak:.4f}")
+    if total["cost_complete"]:
+        lines.append(f"当前时段费用合计: ¥{total['cost_current']:.4f}")
+    else:
+        lines.append(
+            "费用合计: 未完整估算；"
+            f"已知费率部分约 ¥{total['cost_current_partial']:.4f}"
+        )
+        lines.append(
+            "未配置费率模型: " + ", ".join(total["unpriced_models"])
+        )
     lines.append("=" * 52)
     return "\n".join(lines)
 
 
-def print_report():
-    print(format_report())
+def print_report(tracker: UsageTracker | None = None) -> None:
+    print(format_report(tracker))
