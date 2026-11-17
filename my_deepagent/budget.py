@@ -68,6 +68,7 @@ class Account:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cost: float = 0.0
+    unpriced_calls: int = 0
 
     def record_outcome(self, success: bool) -> None:
         if success:
@@ -75,10 +76,15 @@ class Account:
         else:
             self.failures += 1
 
-    def add_usage(self, prompt_tokens: int, completion_tokens: int, cost: float) -> None:
+    def add_usage(
+        self, prompt_tokens: int, completion_tokens: int, cost: float | None
+    ) -> None:
         self.prompt_tokens += max(int(prompt_tokens), 0)
         self.completion_tokens += max(int(completion_tokens), 0)
-        self.cost += cost
+        if cost is None:
+            self.unpriced_calls += 1
+        else:
+            self.cost += max(float(cost), 0.0)
 
 
 def scope_of(config: dict[str, Any] | None) -> str:
@@ -207,27 +213,46 @@ def _is_within_dir(path: Path, base: Path) -> bool:
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
-    """原子写入文本：先写临时文件再替换，避免进程中断留下半截文件。"""
+    """原子写入文本，使用唯一临时文件避免并发写入互相覆盖。"""
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(content, encoding="utf-8")
-    temp.replace(path)
+    temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp.write_text(content, encoding="utf-8")
+        temp.replace(path)
+    finally:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _resolve_findings_path(run_dir: Path, file_path: str) -> Path | None:
+    """将输入路径解析到 run_dir/findings 内；拒绝穿越和目录外符号链接。"""
+    run_dir = Path(run_dir).resolve()
+    findings_dir = (run_dir / "findings").resolve()
+    if not _is_within_dir(findings_dir, run_dir):
+        return None
+    normalized = str(file_path or "").replace("\\", "/")
+    parts = normalized.split("/")
+    try:
+        findings_index = parts.index("findings")
+    except ValueError:
+        return None
+    relative_parts = parts[findings_index + 1 :]
+    if not relative_parts or any(part in {"", ".", ".."} for part in relative_parts):
+        return None
+    if relative_parts[-1].lower() == "plan.md":
+        return None
+    target = findings_dir.joinpath(*relative_parts).resolve()
+    if not _is_within_dir(target, findings_dir):
+        return None
+    return target
 
 
 def _locate_finding(run_dir: Path, file_path: str) -> Path | None:
-    """把 read_file 传入的路径定位到 findings 目录下的真实文件；非 Findings 返回 None。"""
-    run_dir = Path(run_dir).resolve()
-    norm = file_path.replace("\\", "/")
-    idx = norm.find("findings/")
-    if idx < 0:
-        return None
-    rel = norm[idx:]
-    if rel.rstrip("/").endswith("plan.md"):
-        return None
-    target = (run_dir / rel).resolve()
-    if not _is_within_dir(target, run_dir):
-        return None
-    return target if target.is_file() else None
+    """把 read_file 路径定位到 findings 子目录；任何目录穿越均返回 None。"""
+    target = _resolve_findings_path(run_dir, file_path)
+    return target if target is not None and target.is_file() else None
 
 
 def _summarize_finding(path: Path) -> str:
@@ -399,7 +424,7 @@ class BudgetManager:
         kind: str,
         prompt_tokens: int,
         completion_tokens: int,
-        cost: float = 0.0,
+        cost: float | None = None,
     ) -> None:
         with self._lock:
             self._account(scope, kind).add_usage(prompt_tokens, completion_tokens, cost)
@@ -411,7 +436,11 @@ class BudgetManager:
         if self.max_tokens is None and self.max_cost is None:
             return True, None
         upper_tokens = max(int(upper_tokens), 0)
-        upper_cost = estimate_cost(0, upper_tokens, model, self.pricing_tier) or 0.0
+        estimated_cost = estimate_cost(0, upper_tokens, model, self.pricing_tier)
+        # max_cost 是硬上限：费率未知时不能把成本当成 0 放行。
+        if self.max_cost is not None and estimated_cost is None:
+            return False, None
+        upper_cost = estimated_cost if estimated_cost is not None else 0.0
         with self._lock:
             if self.max_tokens is not None and (
                 self._settled_tokens + self._reserved_tokens + upper_tokens
@@ -439,9 +468,8 @@ class BudgetManager:
         """调用结束后用真实 usage 结算并释放预留。"""
         if reservation_id is None:
             return
-        actual_cost = (
-            estimate_cost(prompt_tokens, completion_tokens, model, self.pricing_tier)
-            or 0.0
+        actual_cost = estimate_cost(
+            prompt_tokens, completion_tokens, model, self.pricing_tier
         )
         with self._lock:
             entry = self._reservations.pop(reservation_id, (0, 0.0))
@@ -449,6 +477,9 @@ class BudgetManager:
             self._reserved_tokens -= upper_tokens
             self._reserved_cost -= upper_cost
             self._settled_tokens += int(prompt_tokens) + int(completion_tokens)
+            if actual_cost is None:
+                # max_cost 开启时未知费率请求已在 reserve_usage 阶段被阻断。
+                actual_cost = upper_cost if self.max_cost is not None else 0.0
             self._settled_cost += actual_cost
 
     def consume_reservation(self, reservation_id: int | None) -> None:
@@ -478,6 +509,7 @@ class BudgetManager:
                     "prompt_tokens": acct.prompt_tokens,
                     "completion_tokens": acct.completion_tokens,
                     "cost": round(acct.cost, 6),
+                    "unpriced_calls": acct.unpriced_calls,
                 }
             return {
                 "limits": {
@@ -496,6 +528,7 @@ class BudgetManager:
                 "reserved_tokens": self._reserved_tokens,
                 "settled_cost": round(self._settled_cost, 6),
                 "reserved_cost": round(self._reserved_cost, 6),
+                "unpriced_calls": sum(acct.unpriced_calls for acct in self._ledger.values()),
                 "ledger": ledger,
             }
 
@@ -556,14 +589,23 @@ class BudgetMiddleware(AgentMiddleware):
                     + self.budget.max_context_chars
                     + _DEEP_INTERNAL_OUTPUT_TOKENS
                 )
-                ok, reservation_id = self.budget.reserve_usage(
-                    upper_tokens, self._tool_model()
-                )
+                tool_model = self._tool_model()
+                ok, reservation_id = self.budget.reserve_usage(upper_tokens, tool_model)
                 if not ok:
-                    return ToolMessage(
-                        content="Token/费用预算已耗尽，请基于已获得材料完成判断。",
-                        tool_call_id=tool_call.get("id"),
-                    )
+                    if (
+                        self.budget.max_cost is not None
+                        and estimate_cost(
+                            0, upper_tokens, tool_model, self.budget.pricing_tier
+                        ) is None
+                    ):
+                        message = (
+                            "当前模型未配置可核验费率，且本次启用了 max_cost。"
+                            "为避免费用硬约束失效，已阻止本次深度研究调用；"
+                            "请为当前模型配置准确费率映射（PRICING/DEEPSEEK_PRICING_TIER），或关闭 max_cost。"
+                        )
+                    else:
+                        message = "Token/费用预算已耗尽，请基于已获得材料完成判断。"
+                    return ToolMessage(content=message, tool_call_id=tool_call.get("id"))
 
             collector = UsageTracker()
             try:
@@ -580,7 +622,7 @@ class BudgetMiddleware(AgentMiddleware):
                 raise
             prompt, completion = _collector_totals(collector)
             model = self._tool_model()
-            cost = estimate_cost(prompt, completion, model, self.budget.pricing_tier) or 0.0
+            cost = estimate_cost(prompt, completion, model, self.budget.pricing_tier)
             if reservation_id is not None:
                 self.budget.settle_usage(reservation_id, prompt, completion, model)
             self.budget.add_usage(scope, name, prompt, completion, cost)
@@ -616,21 +658,21 @@ class BudgetMiddleware(AgentMiddleware):
 
         run_dir = self.run_dir.resolve()
         findings_dir = run_dir / "findings"
-        findings_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            findings_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return result
 
-        # 从 task 描述中解析出的 Findings 路径优先；仅当路径确实落在 run 目录内
-        # 才使用，否则退化为安全的固定文件名，避免越界写入。
+        # 从 task 描述解析的路径必须严格落在 findings 子目录内。
         target: Path | None = None
         if rel_match:
-            candidate = (run_dir / rel_match.group(0)).resolve()
-            if _is_within_dir(candidate, run_dir):
-                target = candidate
+            target = _resolve_findings_path(run_dir, rel_match.group(0))
 
         if target is None:
             safe_id = re.sub(r"[^A-Za-z0-9_-]", "", call_id) or uuid.uuid4().hex[:8]
-            target = findings_dir / f"task_{safe_id}.md"
-            if not _is_within_dir(target, run_dir):
-                target = findings_dir / f"task_{uuid.uuid4().hex[:8]}.md"
+            target = _resolve_findings_path(run_dir, f"findings/task_{safe_id}.md")
+            if target is None:
+                return result
 
         try:
             already_saved = (
@@ -648,7 +690,8 @@ class BudgetMiddleware(AgentMiddleware):
             try:
                 _atomic_write_text(target, header + content + "\n")
             except OSError:
-                pass
+                # 写盘失败时不能向 Chief 谎报“已持久化”；保留原始 task 返回内容。
+                return result
 
         summary = (
             f"研究任务已完成，结果已持久化到 {target.relative_to(run_dir)}"
@@ -674,9 +717,20 @@ class BudgetMiddleware(AgentMiddleware):
 
         ok, reservation_id = self.budget.reserve_usage(upper_tokens, model_name)
         if not ok:
-            return AIMessage(
-                content="Token/费用预算已耗尽，请基于已有材料完成报告。"
-            )
+            if (
+                self.budget.max_cost is not None
+                and estimate_cost(
+                    0, upper_tokens, model_name, self.budget.pricing_tier
+                ) is None
+            ):
+                message = (
+                    "当前模型未配置可核验费率，且本次启用了 max_cost。"
+                    "为避免费用硬约束失效，已阻止本次模型调用；"
+                    "请为当前模型配置准确费率映射（PRICING/DEEPSEEK_PRICING_TIER），或关闭 max_cost。"
+                )
+            else:
+                message = "Token/费用预算已耗尽，请基于已有材料完成报告。"
+            return AIMessage(content=message)
 
         try:
             response = await handler(request)
@@ -689,7 +743,7 @@ class BudgetMiddleware(AgentMiddleware):
         if usage is not None:
             prompt, completion = usage
             self.budget.settle_usage(reservation_id, prompt, completion, model_name)
-            cost = estimate_cost(prompt, completion, model_name, self.budget.pricing_tier) or 0.0
+            cost = estimate_cost(prompt, completion, model_name, self.budget.pricing_tier)
             self.budget.add_usage(scope, KIND_REASONING, prompt, completion, cost)
         else:
             # 缺少 usage_metadata 时释放预留，避免预留泄漏。
